@@ -24,6 +24,8 @@
 
 # In[3]:
 
+import dotenv
+dotenv.load_dotenv()
 
 import torch
 import pickle
@@ -163,7 +165,7 @@ def train(confPath):
     # Training
     model = LightningWrapper(coreModel, loss_ctc, optimizer, args, scheduler, willetts_preprocessing_pipeline = args['pppipeline'])
 
-
+    wandb_logger.watch(model, log="all")
     # In[9]:
 
 
