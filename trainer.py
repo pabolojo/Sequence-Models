@@ -1,34 +1,8 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# In[1]:
-
-
-#!cd $HOME/speechBCI/NeuralDecoder && pip install --user -e .
-#!cd $HOME/speechBCI/LanguageModelDecoder/runtime/server/x86 && python setup.py install
-#!pip install causal-conv1d
-#!cd $HOME/mamba && pip install --user -e .
-#!cd $HOME/neural_seq_decoder && pip install --user -e .
-#!pip install pytorch-lightning
-#!pip install tensorboard
-
-
-# ### Imports and Script vars
-
-# In[2]:
-
-
-#%load_ext autoreload
-#%autoreload 2
-
-
-# In[3]:
-
 import dotenv
 dotenv.load_dotenv()
 
 import torch
-import pickle
+import yaml
 import os
 import time
 import numpy as np
@@ -36,100 +10,43 @@ import pytorch_lightning as pl
 import sys
 
 from models.datasetLoaders import getDatasetLoaders
-from models.mamba_phoneme import MambaPhoneme
 from models.lightning_wrapper import LightningWrapper
-from mamba_ssm.models.config_mamba import MambaConfig
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+from pytorch_lightning import seed_everything
 #from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.tuner import Tuner
 
-def train(confPath):
-    # Load the configuration pickle file
-    print("Loading configuration from: ", confPath, flush=True)
-    args = pickle.load(open(confPath, 'rb'))
+def train(hparamsPath):
+    # Load the hparams yaml file
+    print("Loading hparams from: ", hparamsPath, flush=True)
+    with open(hparamsPath, 'r') as f:
+        hparams = yaml.safe_load(f)
 
-    ssm_cfg = {
-            'd_state'   : args["d_state"],
-            'd_conv'    : args["d_conv"],
-            'expand'    : args["expand"],
-            'dt_rank'   : args["dt_rank"],
-            'dt_min'    : args["dt_min"],
-            'dt_max'    : args["dt_max"],
-            'dt_init'   : args["dt_init"],
-            'dt_scale'  : args["dt_scale"],
-            'dt_init_floor' : args["dt_init_floor"],
-            'conv_bias' : args["conv_bias"],
-            'bias'      : args["bias"],
-            'use_fast_path' : args["use_fast_path"],  # Fused kernel options
-            }
-
-    torch.manual_seed(args["seed"])
-    np.random.seed(args["seed"])
-
+    seed_everything(hparams["seed"], workers=True)
 
     # ### Load Datasets
 
-    # In[5]:
-
-
     trainLoader, testLoader, loadedData = getDatasetLoaders(
-        args['dataset'], args['batchSize']
+        hparams['dataset'], hparams['batchSize']
     )
 
-    args['nDays'] = len(loadedData["train"])
-
-
-    # ### Initialize model
-
-    # In[6]:
-
-
-    coreModel = MambaPhoneme(
-        config=MambaConfig(
-            d_model=args['nInputFeatures'],
-            n_layer=args['nLayers'],
-            vocab_size=args['nClasses'],
-            ssm_cfg=ssm_cfg,
-            rms_norm=False,
-            residual_in_fp32=False,
-            fused_add_norm=False,
-        ),
-        device=args['device'],
-        dtype=torch.float32,
-    )
-
-
-    # In[7]:
-
-
-    print(coreModel.modelName)
-    print('Number of parameters: ', sum(p.numel() for p in coreModel.parameters() if p.requires_grad))
-    print('\n--------------------\n')
-    print(coreModel)
-    print('\n--------------------\n')
-
+    hparams['nDays'] = len(loadedData["train"])
 
     # ### Train
 
-    # In[8]:
-
-
     # Set seeds and setup output directory
     timestamp = int(time.time())
-    logsPath = args['baseDir'] + "experiments/logs"
-    checkpointPath = args['experimentPath'] + "/checkpoints/" + args['modelName'] + "_" + str(timestamp)
-
-    # Define the logger
-    #logger = TensorBoardLogger(logsPath, name=coreModel.modelName)
-    wandb_logger = WandbLogger(project='PNPL', name=args['modelName'], log_model='all', save_dir=logsPath)
+    logsPath = hparams['baseDir'] + "experiments/logs"
+    checkpointPath = hparams['experimentPath'] + "/checkpoints/" + hparams['modelName'] + "_" + str(timestamp)
 
     # Define the checkpoint callback
     checkpoint_callback = ModelCheckpoint(
         dirpath=checkpointPath,
-        monitor='val_loss',
+        monitor='avg_val_cer',
         filename='{epoch:02d}-{val_loss:.2f}-{avg_val_cer:.2f}',
         save_last=False,
-        save_top_k=2,
+        save_top_k=1,
         verbose=True,
         mode='min'
     )
@@ -143,48 +60,56 @@ def train(confPath):
         mode='min'
     )
 
-    callbacks = [checkpoint_callback, early_stop_callback]
-
-    loss_ctc = torch.nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
-
-    optimizer = torch.optim.Adam(
-        coreModel.parameters(),
-        lr=args["lrStart"],
-        betas=(0.9, 0.999),
-        eps=0.1,
-        weight_decay=args["l2_decay"],
-    )
-
-    scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=1.0,
-        end_factor=args["lrEnd"] / args["lrStart"],
-        total_iters=args["nEpochs"],
-    )
+    callbacks = [checkpoint_callback] #, early_stop_callback]
 
     # Training
-    model = LightningWrapper(coreModel, loss_ctc, optimizer, args, scheduler, willetts_preprocessing_pipeline = args['pppipeline'])
+    model = LightningWrapper(hparams)
 
-    wandb_logger.watch(model, log="all")
+    # Define the logger
+    #logger = TensorBoardLogger(logsPath, name=coreModel.modelName)
+    wandb_logger = None
+    if hparams['log_wandb']:
+        wandb_logger = WandbLogger(project='PNPL', name=hparams['modelName'], log_model='all', save_dir=logsPath)
+        wandb_logger.watch(model, log="all")
+
     # In[9]:
 
-
     trainer = pl.Trainer(
-        max_epochs=args["nEpochs"],
+        max_epochs=hparams["nEpochs"],
         log_every_n_steps=100,
         check_val_every_n_epoch=1,
         logger=wandb_logger,
         callbacks=callbacks,
-        enable_progress_bar=False
+        enable_progress_bar=False,
     )
 
-    trainer.fit(model, trainLoader, val_dataloaders=testLoader)
+    if hparams['lrFinder']:
+        print("Running LR finder", flush=True)
+
+        tuner = Tuner(trainer)
+
+        lr_finder = tuner.lr_find(
+            model,
+            trainLoader,
+            val_dataloaders=testLoader,
+            min_lr=hparams["lrEnd"],
+            max_lr=hparams["lr"],
+            num_training=10,
+            mode="exponential",
+            early_stop_threshold=2.0)
+
+        print("Suggested learning rate: ", lr_finder.suggestion(), flush=True)
+
+        model.hparams.lr = lr_finder.suggestion()
+    
+    if hparams['resume']:
+        print("Resuming from checkpoint: ", hparams['resume'], flush=True)
+
+    trainer.fit(model, trainLoader, val_dataloaders=testLoader, ckpt_path=hparams['resume'] if 'resume' in hparams else None)
 
 
 # In[ ]:
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
-        confPath = sys.argv[1]
-        train(confPath)
-
+        train(sys.argv[1])

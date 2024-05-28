@@ -2,61 +2,85 @@ import pytorch_lightning as pl
 import torch
 import numpy as np
 from neural_decoder.augmentations import GaussianSmoothing
+from models.mamba_phoneme import MambaPhoneme
+from mamba_ssm.models.config_mamba import MambaConfig
 
 from edit_distance import SequenceMatcher
 
 class LightningWrapper(pl.LightningModule):
-    def __init__(self, model, loss_ctc, optimizer, args, scheduler=None, willetts_preprocessing_pipeline = True):
+    def __init__(self, hparams):
         super().__init__()
-        self.save_hyperparameters()
-        self.loss_ctc = loss_ctc
-        self.optimizer = optimizer
-        self.args = args
-        self.scheduler = scheduler
-        self.willetts_preprocessing_pipeline = willetts_preprocessing_pipeline
+        self.save_hyperparameters(hparams)
 
+        self.loss_ctc = torch.nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
         self.validation_step_outputs = {'val_loss': [], 'val_cer': []}
 
-        if self.willetts_preprocessing_pipeline:
+        if self.hparams.pppipeline:
             self.gaussianSmoother = GaussianSmoothing(
-                args['nInputFeatures'], 20, args["gaussianSmoothWidth"], dim=1
+                self.hparams.nInputFeatures, 20, self.hparams.gaussianSmoothWidth, dim=1
             )
-            self.dayWeights = torch.nn.Parameter(torch.randn(args['nDays'], args['nInputFeatures'], args['nInputFeatures']))
-            self.dayBias = torch.nn.Parameter(torch.zeros(args['nDays'], 1, args['nInputFeatures']))
+            self.dayWeights = torch.nn.Parameter(torch.randn(self.hparams.nDays, self.hparams.nInputFeatures, self.hparams.nInputFeatures))
+            self.dayBias = torch.nn.Parameter(torch.zeros(self.hparams.nDays, 1, self.hparams.nInputFeatures))
 
-            for x in range(args['nDays']):
-                self.dayWeights.data[x, :, :] = torch.eye(args['nInputFeatures'])
+            for x in range(self.hparams.nDays):
+                self.dayWeights.data[x, :, :] = torch.eye(self.hparams.nInputFeatures)
 
             # Input layers
-            for x in range(args['nDays']):
-                setattr(self, "inpLayer" + str(x), torch.nn.Linear(args['nInputFeatures'], args['nInputFeatures']))
+            for x in range(self.hparams.nDays):
+                setattr(self, "inpLayer" + str(x), torch.nn.Linear(self.hparams.nInputFeatures, self.hparams.nInputFeatures))
 
-            for x in range(args['nDays']):
+            for x in range(self.hparams.nDays):
                 thisLayer = getattr(self, "inpLayer" + str(x))
                 thisLayer.weight = torch.nn.Parameter(
-                    thisLayer.weight + torch.eye(args['nInputFeatures'])
+                    thisLayer.weight + torch.eye(self.hparams.nInputFeatures)
                 )
 
             self.inputLayerNonlinearity = torch.nn.Softsign()
 
-        self.model = model
+        if self.hparams.modelType == "mamba":
+            self.coreModel = MambaPhoneme(
+                config=MambaConfig(
+                    d_model=self.hparams.nInputFeatures,
+                    n_layer=self.hparams.nLayers,
+                    vocab_size=self.hparams.nClasses,
+                    ssm_cfg={
+                        'd_state'   : self.hparams.d_state,
+                        'd_conv'    : self.hparams.d_conv,
+                        'expand'    : self.hparams.expand,
+                        'dt_rank'   : self.hparams.dt_rank,
+                        'dt_min'    : self.hparams.dt_min,
+                        'dt_max'    : self.hparams.dt_max,
+                        'dt_init'   : self.hparams.dt_init,
+                        'dt_scale'  : self.hparams.dt_scale,
+                        'dt_init_floor' : self.hparams.dt_init_floor,
+                        'conv_bias' : self.hparams.conv_bias,
+                        'bias'      : self.hparams.bias,
+                        'use_fast_path' : self.hparams.use_fast_path,  # Fused kernel options
+                        },
+                    rms_norm=False,
+                    residual_in_fp32=False,
+                    fused_add_norm=False,
+                ),
+                device=self.hparams.device,
+                dtype=torch.float32,
+            )
         
-        self.fc_decoder_out = torch.nn.Linear(args['nHiddenFeatures'], args['nClasses'] + 1)
+        self.fc_decoder_out = torch.nn.Linear(self.hparams.nHiddenFeatures, self.hparams.nClasses + 1)
 
     def batch_to_device(self, batch):
         X, y, X_len, y_len, dayIdx = batch
         X, y, X_len, y_len, dayIdx = (
-            X.to(self.args['device']),
-            y.to(self.args['device']),
-            X_len.to(self.args['device']),
-            y_len.to(self.args['device']),
-            dayIdx.to(self.args['device']),
+            X.to(self.hparams.device),
+            y.to(self.hparams.device),
+            X_len.to(self.hparams.device),
+            y_len.to(self.hparams.device),
+            dayIdx.to(self.hparams.device),
         )
         return X, y, X_len, y_len, dayIdx
 
     def forward(self, neuralInput, dayIdx):
 
-        if self.willetts_preprocessing_pipeline:
+        if self.hparams.pppipeline:
             # apply gaussian smoother
             neuralInput = torch.permute(neuralInput, (0, 2, 1))
             neuralInput = self.gaussianSmoother(neuralInput)
@@ -69,23 +93,22 @@ class LightningWrapper(pl.LightningModule):
             ) + torch.index_select(self.dayBias, 0, dayIdx)
             neuralInput = self.inputLayerNonlinearity(transformedNeural)
 
-        hidden = self.model(neuralInput) #transformedNeural)
+        hidden = self.coreModel(neuralInput)
 
         return self.fc_decoder_out(hidden)
 
     def training_step(self, batch, batch_idx):
-        self.optimizer.zero_grad()
 
         X, y, X_len, y_len, dayIdx = self.batch_to_device(batch)
 
         # Noise augmentation is faster on GPU
-        if self.args["whiteNoiseSD"] > 0:
-            X += torch.randn(X.shape, device=self.args['device']) * self.args["whiteNoiseSD"]
+        if self.hparams.whiteNoiseSD > 0:
+            X += torch.randn(X.shape, device=self.hparams.device) * self.hparams.whiteNoiseSD
 
-        if self.args["constantOffsetSD"] > 0:
+        if self.hparams.constantOffsetSD > 0:
             X += (
-            torch.randn([X.shape[0], 1, X.shape[2]], device=self.args['device'])
-            * self.args["constantOffsetSD"]
+            torch.randn([X.shape[0], 1, X.shape[2]], device=self.hparams.device)
+            * self.hparams.constantOffsetSD
             )
 
         logits = self(X, dayIdx)
@@ -100,9 +123,7 @@ class LightningWrapper(pl.LightningModule):
         
         self.log('train_loss', loss.detach())
 
-        loss.backward()
-        self.optimizer.step()
-        self.scheduler.step()
+        return loss
     
     def validation_step(self, batch, batch_idx):
         total_edit_distance = 0
@@ -148,6 +169,8 @@ class LightningWrapper(pl.LightningModule):
         self.validation_step_outputs['val_loss'].append(loss)
         self.validation_step_outputs['val_cer'].append(cer)
 
+        return loss
+
     def on_validation_epoch_end(self):
         avg_loss = torch.stack(self.validation_step_outputs['val_loss']).mean()
         avg_acc = sum(self.validation_step_outputs['val_cer']) / len(self.validation_step_outputs['val_cer'])
@@ -159,8 +182,18 @@ class LightningWrapper(pl.LightningModule):
         self.validation_step_outputs['val_cer'].clear()
 
     def configure_optimizers(self):
-        return {
-            'optimizer': self.optimizer,
-            'lr_scheduler': self.scheduler,
-            'monitor': 'train_loss'  # Optional, if you want to monitor a specific metric
-            }
+        optimizer = torch.optim.Adam(
+            self.parameters(),
+            lr=self.hparams.lr,
+        )
+
+        if self.hparams.useScheduler:
+            scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=1.0,
+                end_factor=self.hparams.lrEnd / self.hparams.lr,
+                total_iters=100
+            )
+            return [optimizer], [scheduler]
+        else:
+            return optimizer
