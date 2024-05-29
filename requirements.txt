@@ -1,0 +1,5 @@
+#incomplete
+#install neural_torch_decoder
+pip install edit-distance
+pip install einops
+pip install python-dotenv
