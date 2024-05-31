@@ -1,0 +1,5 @@
+train_s4.py --seed=0
+train_s4.py --seed=1
+train_s4.py --seed=2
+train_s4.py --seed=3
+train_s4.py --seed=4

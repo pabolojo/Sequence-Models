@@ -1,8 +1,7 @@
 import pytorch_lightning as pl
 import torch
 import numpy as np
-from neural_decoder.augmentations import GaussianSmoothing
-from models.mamba_phoneme import MambaPhoneme
+from neural_decoder.augmentations import GaussianSmoothing 
 from models.s4backbone import S4Backbone
 
 from edit_distance import SequenceMatcher
@@ -41,13 +40,16 @@ class S4Lightning(pl.LightningModule):
             self.coreModel = S4Backbone(
                 d_input=self.hparams.nInputFeatures,
                 d_model=self.hparams.nHiddenFeatures,
-                d_output=self.hparams.nClasses + 1,
+                d_output=self.hparams.nHiddenFeatures,
                 n_layers=self.hparams.nLayers,
                 dropout=0.2,
                 prenorm=False,
+                lr=self.hparams.lr,
             )
         
         self.fc_decoder_out = torch.nn.Linear(self.hparams.nHiddenFeatures, self.hparams.nClasses + 1)
+
+        print("Number of parameters: ", sum(p.numel() for p in self.parameters() if p.requires_grad))
 
     def batch_to_device(self, batch):
         X, y, X_len, y_len, dayIdx = batch
@@ -126,7 +128,7 @@ class S4Lightning(pl.LightningModule):
         adjustedLens = X_len
         for iterIdx in range(logits.shape[0]):
             decodedSeq = torch.argmax(
-                torch.tensor(logits[iterIdx, 0 : adjustedLens[iterIdx], :]),
+                logits[iterIdx, 0 : adjustedLens[iterIdx], :],
                 dim=-1,
             )  # [num_seq,]
             decodedSeq = torch.unique_consecutive(decodedSeq, dim=-1)
@@ -164,11 +166,26 @@ class S4Lightning(pl.LightningModule):
         self.validation_step_outputs['val_cer'].clear()
 
     def configure_optimizers(self): 
-        optimizer = torch.optim.Adam(
-            self.parameters(),
-            lr=self.hparams.lr,
-            weight_decay=self.hparams.weightDecay,
-        )
+        
+        all_parameters = list(self.parameters())
+
+        # General parameters don't contain the special _optim key
+        params = [p for p in all_parameters if not hasattr(p, "_optim")]
+
+        # Create an optimizer with the general parameters
+        optimizer = torch.optim.AdamW(params, lr=self.hparams.lr, weight_decay=self.hparams.weightDecay,)
+
+        # Add parameters with special hyperparameters
+        hps = [getattr(p, "_optim") for p in all_parameters if hasattr(p, "_optim")]
+        hps = [
+            dict(s) for s in sorted(list(dict.fromkeys(frozenset(hp.items()) for hp in hps)))
+        ]  # Unique dicts
+        for hp in hps:
+            params = [p for p in all_parameters if getattr(p, "_optim", None) == hp]
+            optimizer.add_param_group(
+                {"params": params, **hp}
+            )
+
 
         if self.hparams.useScheduler:
             scheduler = torch.optim.lr_scheduler.LinearLR(

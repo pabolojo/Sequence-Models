@@ -7,3 +7,4 @@ neural_seq_decoder/
 out/
 speechBCI/
 *.sh
+results/

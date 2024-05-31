@@ -23,6 +23,7 @@ class S4Backbone(nn.Module):
         n_layers=4,
         dropout=0.2,
         prenorm=False,
+        lr=0.001,
     ):
         super().__init__()
 
@@ -37,7 +38,7 @@ class S4Backbone(nn.Module):
         self.dropouts = nn.ModuleList()
         for _ in range(n_layers):
             self.s4_layers.append(
-                S4D(d_model, dropout=dropout, transposed=True, lr=min(0.001, args.lr))
+                S4D(d_model, dropout=dropout, transposed=True, lr=min(0.001, lr))
             )
             self.norms.append(nn.LayerNorm(d_model))
             self.dropouts.append(dropout_fn(dropout))
@@ -74,9 +75,6 @@ class S4Backbone(nn.Module):
                 x = norm(x.transpose(-1, -2)).transpose(-1, -2)
 
         x = x.transpose(-1, -2)
-
-        # Pooling: average pooling over the sequence length
-        x = x.mean(dim=1)
 
         # Decode the outputs
         x = self.decoder(x)  # (B, d_model) -> (B, d_output)
