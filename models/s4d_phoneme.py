@@ -13,13 +13,12 @@ else:
 
 
 
-class S4Backbone(nn.Module):
+class S4DPhoneme(nn.Module):
 
     def __init__(
         self,
-        d_input,
-        d_output=10,
         d_model=256,
+        d_state=64,
         n_layers=4,
         dropout=0.2,
         prenorm=False,
@@ -29,28 +28,21 @@ class S4Backbone(nn.Module):
 
         self.prenorm = prenorm
 
-        # Linear encoder (d_input = 1 for grayscale and 3 for RGB)
-        self.encoder = nn.Linear(d_input, d_model)
-
         # Stack S4 layers as residual blocks
         self.s4_layers = nn.ModuleList()
         self.norms = nn.ModuleList()
         self.dropouts = nn.ModuleList()
         for _ in range(n_layers):
             self.s4_layers.append(
-                S4D(d_model, dropout=dropout, transposed=True, lr=min(0.001, lr))
+                S4D(d_model, d_state=d_state, dropout=dropout, transposed=True, lr=min(0.001, lr))
             )
             self.norms.append(nn.LayerNorm(d_model))
             self.dropouts.append(dropout_fn(dropout))
 
-        # Linear decoder
-        self.decoder = nn.Linear(d_model, d_output)
-
     def forward(self, x):
         """
-        Input x is shape (B, L, d_input)
+        Input x is shape (B, L, d_model)
         """
-        x = self.encoder(x)  # (B, L, d_input) -> (B, L, d_model)
 
         x = x.transpose(-1, -2)  # (B, L, d_model) -> (B, d_model, L)
         for layer, norm, dropout in zip(self.s4_layers, self.norms, self.dropouts):
@@ -74,10 +66,7 @@ class S4Backbone(nn.Module):
                 # Postnorm
                 x = norm(x.transpose(-1, -2)).transpose(-1, -2)
 
-        x = x.transpose(-1, -2)
-
-        # Decode the outputs
-        x = self.decoder(x)  # (B, d_model) -> (B, d_output)
+        x = x.transpose(-1, -2) # (B, d_model, L) -> (B, L, d_model)
 
         return x
 

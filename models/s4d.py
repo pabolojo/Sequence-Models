@@ -35,7 +35,7 @@ class DropoutNd(nn.Module):
 class S4DKernel(nn.Module):
     """Generate convolution kernel from diagonal SSM parameters."""
 
-    def __init__(self, d_model, N=64, dt_min=0.001, dt_max=0.1, lr=None):
+    def __init__(self, d_model, N=64, dt_min=0.002, dt_max=1.0, lr=None):
         super().__init__()
         # Generate dt
         H = d_model
@@ -47,7 +47,7 @@ class S4DKernel(nn.Module):
         self.C = nn.Parameter(torch.view_as_real(C))
         self.register("log_dt", log_dt, lr)
 
-        log_A_real = torch.log(0.5 * torch.ones(H, N//2))
+        log_A_real = torch.log(torch.ones(H, N//2))
         A_imag = math.pi * repeat(torch.arange(N//2), 'n -> h n', h=H)
         self.register("log_A_real", log_A_real, lr)
         self.register("A_imag", A_imag, lr)
@@ -129,3 +129,10 @@ class S4D(nn.Module):
         y = self.output_linear(y)
         if not self.transposed: y = y.transpose(-1, -2)
         return y, None # Return a dummy state to satisfy this repo's interface, but this can be modified
+
+    def get_ssm(self):
+        dt = torch.exp(self.kernel.log_dt).detach().cpu().numpy() # (H)
+        C = torch.view_as_complex(self.kernel.C).detach().cpu().numpy() # (H N)
+        A = -torch.exp(self.kernel.log_A_real) + 1j * self.kernel.A_imag # (H N)
+        A = A.detach().cpu().numpy()
+        return [dt, A, C]

@@ -4,6 +4,7 @@ import numpy as np
 from neural_decoder.augmentations import GaussianSmoothing
 from models.mamba_phoneme import MambaPhoneme
 from mamba_ssm.models.config_mamba import MambaConfig
+from models.s4d_phoneme import S4DPhoneme
 
 from edit_distance import SequenceMatcher
 
@@ -64,8 +65,19 @@ class LightningWrapper(pl.LightningModule):
                 device=self.hparams.device,
                 dtype=torch.float32,
             )
+        elif self.hparams.modelType == "s4":
+            self.coreModel = S4DPhoneme(
+                d_model=self.hparams.nInputFeatures,
+                d_state=self.hparams.d_state,
+                n_layers=self.hparams.nLayers,
+                dropout=0.2,
+                prenorm=False,
+                lr=self.hparams.lr,
+            )
         
         self.fc_decoder_out = torch.nn.Linear(self.hparams.nHiddenFeatures, self.hparams.nClasses + 1)
+
+        print("Number of parameters: ", sum(p.numel() for p in self.parameters() if p.requires_grad))
 
     def batch_to_device(self, batch):
         X, y, X_len, y_len, dayIdx = batch
@@ -182,10 +194,31 @@ class LightningWrapper(pl.LightningModule):
         self.validation_step_outputs['val_cer'].clear()
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(
-            self.parameters(),
-            lr=self.hparams.lr,
-        )
+
+        all_parameters = list(self.parameters())
+
+        # General parameters don't contain the special _optim key
+        params = [p for p in all_parameters if not hasattr(p, "_optim")]
+
+        # Create an optimizer with the general parameters
+        optimizer = torch.optim.AdamW(params, lr=self.hparams.lr, weight_decay=self.hparams.weightDecay,)
+
+        # Add parameters with special hyperparameters
+        hps = [getattr(p, "_optim") for p in all_parameters if hasattr(p, "_optim")]
+        hps = [
+            dict(s) for s in sorted(list(dict.fromkeys(frozenset(hp.items()) for hp in hps)))
+        ]  # Unique dicts
+        for hp in hps:
+            params = [p for p in all_parameters if getattr(p, "_optim", None) == hp]
+            optimizer.add_param_group(
+                {"params": params, **hp}
+            )
+        
+        # Mamba uses Adam not AdamW
+        #optimizer = torch.optim.Adam(
+        #    self.parameters(),
+        #    lr=self.hparams.lr,
+        #)
 
         if self.hparams.useScheduler:
             scheduler = torch.optim.lr_scheduler.LinearLR(
