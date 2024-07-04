@@ -1,6 +1,7 @@
 import pytorch_lightning as pl
 import torch
 import numpy as np
+import pickle
 from neural_decoder.augmentations import GaussianSmoothing
 from models.mamba_phoneme import MambaPhoneme
 from mamba_ssm.models.config_mamba import MambaConfig
@@ -38,26 +39,33 @@ class LightningWrapper(pl.LightningModule):
 
             self.inputLayerNonlinearity = torch.nn.Softsign()
 
+        ssm_init = None
+        if self.hparams.custom_init:
+            print("Loading custom SSM init", flush=True)
+            ssm_init = pickle.load(open(self.hparams.experimentPath+ '/ssm_init.pkl', "rb"))
+
         if self.hparams.modelType == "mamba":
+            ssm_config = {
+                'd_state'   : self.hparams.d_state,
+                'd_conv'    : self.hparams.d_conv,
+                'expand'    : self.hparams.expand,
+                'dt_rank'   : self.hparams.dt_rank,
+                'dt_min'    : self.hparams.dt_min,
+                'dt_max'    : self.hparams.dt_max,
+                'dt_init'   : self.hparams.dt_init,
+                'dt_scale'  : self.hparams.dt_scale,
+                'dt_init_floor' : self.hparams.dt_init_floor,
+                'conv_bias' : self.hparams.conv_bias,
+                'bias'      : self.hparams.bias,
+                'use_fast_path' : self.hparams.use_fast_path,  # Fused kernel options
+                }
+                    
             self.coreModel = MambaPhoneme(
                 config=MambaConfig(
                     d_model=self.hparams.nInputFeatures,
                     n_layer=self.hparams.nLayers,
                     vocab_size=self.hparams.nClasses,
-                    ssm_cfg={
-                        'd_state'   : self.hparams.d_state,
-                        'd_conv'    : self.hparams.d_conv,
-                        'expand'    : self.hparams.expand,
-                        'dt_rank'   : self.hparams.dt_rank,
-                        'dt_min'    : self.hparams.dt_min,
-                        'dt_max'    : self.hparams.dt_max,
-                        'dt_init'   : self.hparams.dt_init,
-                        'dt_scale'  : self.hparams.dt_scale,
-                        'dt_init_floor' : self.hparams.dt_init_floor,
-                        'conv_bias' : self.hparams.conv_bias,
-                        'bias'      : self.hparams.bias,
-                        'use_fast_path' : self.hparams.use_fast_path,  # Fused kernel options
-                        },
+                    ssm_cfg=ssm_config,
                     rms_norm=False,
                     residual_in_fp32=False,
                     fused_add_norm=False,
@@ -66,13 +74,23 @@ class LightningWrapper(pl.LightningModule):
                 dtype=torch.float32,
             )
         elif self.hparams.modelType == "s4":
+            ssm_config = {
+                'd_state'   : self.hparams.d_state,
+                'train_D'  : self.hparams.train_D,
+                'train_log_dt': self.hparams.train_log_dt,
+                'train_C'  : self.hparams.train_C,
+                'train_log_A_real': self.hparams.train_log_A_real,
+                'train_A_imag': self.hparams.train_A_imag,
+                }
+
             self.coreModel = S4DPhoneme(
                 d_model=self.hparams.nInputFeatures,
-                d_state=self.hparams.d_state,
                 n_layers=self.hparams.nLayers,
-                dropout=0.2,
+                ssm_cfg=ssm_config,
+                dropout=0.,
                 prenorm=False,
                 lr=self.hparams.lr,
+                ssm_init=ssm_init,
             )
         
         self.fc_decoder_out = torch.nn.Linear(self.hparams.nHiddenFeatures, self.hparams.nClasses + 1)

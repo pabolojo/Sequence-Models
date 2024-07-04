@@ -18,11 +18,12 @@ class S4DPhoneme(nn.Module):
     def __init__(
         self,
         d_model=256,
-        d_state=64,
         n_layers=4,
+        ssm_cfg={},
         dropout=0.2,
         prenorm=False,
         lr=0.001,
+        ssm_init=None,
     ):
         super().__init__()
 
@@ -34,10 +35,12 @@ class S4DPhoneme(nn.Module):
         self.dropouts = nn.ModuleList()
         for _ in range(n_layers):
             self.s4_layers.append(
-                S4D(d_model, d_state=d_state, dropout=dropout, transposed=True, lr=min(0.001, lr))
+                S4D(d_model, dropout=dropout, transposed=True, lr=min(0.001, lr), ssm_init=ssm_init, **ssm_cfg)
             )
             self.norms.append(nn.LayerNorm(d_model))
             self.dropouts.append(dropout_fn(dropout))
+
+        self.activation = nn.Identity() #nn.ReLU()
 
     def forward(self, x):
         """
@@ -59,8 +62,8 @@ class S4DPhoneme(nn.Module):
             # Dropout on the output of the S4 block
             z = dropout(z)
 
-            # Residual connection
-            x = z + x
+            # Residual connection and nonlinearity
+            x = self.activation(z + x)
 
             if not self.prenorm:
                 # Postnorm
